@@ -267,6 +267,39 @@ class GossipNode:
                     del self.peers[addr]
                     self.log(f"Peer {addr} removed: 3 consecutive PINGs without PONG")
 
+    def auto_ping_thread(self):
+        """Pings every known peer once every ping_interval."""
+        self.log(f"Auto-ping thread started (Interval: {self.ping_interval}s)")
+        while True:
+            time.sleep(self.ping_interval)
+            with self.lock:
+                peer_addrs = list(self.peers.keys())
+            
+            for addr in peer_addrs:
+                self._send_ping_to_peer(addr)
+
+    def _send_ping_to_peer(self, addr):
+        """Internal helper to send a ping if not already pinged this cycle."""
+        with self.lock:
+            if addr not in self.peers:
+                return
+            
+            peer_info = self.peers[addr]
+            # Check if already pinged in this interval to satisfy "cannot be pinged twice"
+            if peer_info.get('ping_pending', False):
+                return
+
+            peer_info['ping_pending'] = True
+            ping_id = str(uuid.uuid4())
+            self.pending_pings[ping_id] = (addr, int(time.time() * 1000))
+            
+            ping_msg = MessageBuilder.build(
+                'PING', self.node_id, self.self_addr,
+                {"ping_id": ping_id, "seq": 0}, self.ttl
+            )
+        
+        self.send_udp(addr, ping_msg)
+
     # ---------- Bootstrap and CLI ----------
     def start(self):
         """Start listener and periodic threads, optionally bootstrap, then run CLI loop."""
@@ -275,6 +308,9 @@ class GossipNode:
 
         t2 = threading.Thread(target=self.periodic_thread, daemon=True)
         t2.start()
+
+        t3 = threading.Thread(target=self.auto_ping_thread, daemon=True)
+        t3.start()
 
         if self.bootstrap and self.bootstrap != self.self_addr:
             self.log(f"Bootstrapping via {self.bootstrap}...")
