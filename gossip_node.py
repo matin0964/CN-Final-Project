@@ -324,6 +324,21 @@ class GossipNode:
 
         self.cli_loop()
 
+    def send_gossip(text):
+        payload = {
+            "topic": "custom",
+            "data": text,
+            "origin_id": self.node_id,
+            "origin_timestamp_ms": int(time.time() * 1000)
+        }
+        gossip_msg = MessageBuilder.build('GOSSIP', self.node_id, self.self_addr, payload, self.ttl)
+
+        self.seen_messages.add(gossip_msg['msg_id'])
+
+        self.forward_gossip(gossip_msg, self.ttl)
+        self.log(f"Initiated GOSSIP: '{text}'")
+
+
     def cli_loop(self):
         """Interactive CLI for gossip, peers, ping, stats, help, exit."""
         print("\nCommands: gossip <msg> | peers | ping <addr> | stats | help | exit\n")
