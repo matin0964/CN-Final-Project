@@ -22,10 +22,10 @@ class SimulatedNode(GossipNode):
     # def log(self, message):
     #     pass # Suppress logs during bulk simulation
 
-    def send_udp(self, target_addr, message_dict):
-        self.messages_sent_count += 1
-        if self.simulator:
-            self.simulator.deliver_message(target_addr, message_dict)
+    # def send_udp(self, target_addr, message_dict):
+    #     self.messages_sent_count += 1
+    #     if self.simulator:
+    #         self.simulator.deliver_message(target_addr, message_dict)
 
     def handle_message(self,msg):
         if not isinstance(msg, dict):
@@ -38,6 +38,7 @@ class SimulatedNode(GossipNode):
             return
 
         if m_type == GOSSIP:
+            self.simulator.total_messages += 1
             self.has_recieved_gossip = 1
         super().handle_message(msg)
 
