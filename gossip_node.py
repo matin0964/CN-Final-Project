@@ -48,9 +48,15 @@ class GossipNode:
         self.pending_pings = {}
         self.lock = threading.Lock()
 
+        # Control flags for thread shutdown
+        self.running = False
+        self.threads = []
+
         # UDP socket bound to this node's port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow address reuse
         self.sock.bind((self.host, self.port))
+        self.sock.settimeout(1.0)  # Set timeout so we can check running flag periodically
 
         self.log(f"Node Initialized! ID: {self.node_id[:8]}... Addr: {self.self_addr}")
 
@@ -73,7 +79,7 @@ class GossipNode:
     def listen_thread(self):
         """Background thread: continuously read from socket and dispatch incoming messages."""
         self.log("Listener thread started...")
-        while True:
+        while self.running:
             try:
                 data, addr = self.sock.recvfrom(4096)
                 try:
@@ -96,10 +102,19 @@ class GossipNode:
                         self.peers[sender_addr]['last_seen'] = time.time()
 
                 self.handle_message(msg)
+            except socket.timeout:
+                # Timeout occurred, just loop and check running flag again
+                continue
             except socket.error as e:
-                self.log(f"Socket error: {e}")
+                if self.running:  # Only log if we're still supposed to be running
+                    self.log(f"Socket error: {e}")
+                break
             except Exception as e:
-                self.log(f"Unexpected receive error: {e}")
+                if self.running:  # Only log if we're still supposed to be running
+                    self.log(f"Unexpected receive error: {e}")
+                break
+        
+        self.log("Listener thread stopped")
 
     def _add_peer(self, addr, node_id):
         """
@@ -253,7 +268,7 @@ class GossipNode:
     def periodic_thread(self):
         """Background thread: remove peers that have 3+ consecutive failed CLI pings."""
         self.log("Periodic tasks thread started...")
-        while True:
+        while self.running:
             time.sleep(self.ping_interval)
             dead_peers = []
 
@@ -266,17 +281,21 @@ class GossipNode:
                 for addr in dead_peers:
                     del self.peers[addr]
                     self.log(f"Peer {addr} removed: 3 consecutive PINGs without PONG")
+        
+        self.log("Periodic thread stopped")
 
     def auto_ping_thread(self):
         """Pings every known peer once every ping_interval."""
         self.log(f"Auto-ping thread started (Interval: {self.ping_interval}s)")
-        while True:
+        while self.running:
             time.sleep(self.ping_interval)
             with self.lock:
                 peer_addrs = list(self.peers.keys())
             
             for addr in peer_addrs:
                 self._send_ping_to_peer(addr)
+        
+        self.log("Auto-ping thread stopped")
 
     def _send_ping_to_peer(self, addr):
         """Internal helper to send a ping if not already pinged this cycle."""
@@ -303,14 +322,20 @@ class GossipNode:
     # ---------- Bootstrap and CLI ----------
     def start(self):
         """Start listener and periodic threads, optionally bootstrap, then run CLI loop."""
+        self.running = True
+        
+        # Create and start threads
         t1 = threading.Thread(target=self.listen_thread, daemon=True)
         t1.start()
+        self.threads.append(t1)
 
         t2 = threading.Thread(target=self.periodic_thread, daemon=True)
         t2.start()
+        self.threads.append(t2)
 
         t3 = threading.Thread(target=self.auto_ping_thread, daemon=True)
         t3.start()
+        self.threads.append(t3)
 
         if self.bootstrap and self.bootstrap != self.self_addr:
             self.log(f"Bootstrapping via {self.bootstrap}...")
@@ -324,7 +349,40 @@ class GossipNode:
 
         self.cli_loop()
 
-    def send_gossip(text):
+    def stop(self):
+        """
+        Stop all threads and release resources (socket, etc.)
+        This method should be called when shutting down the node.
+        """
+        self.log("Stopping node...")
+        
+        # Signal threads to stop
+        self.running = False
+        
+        # Close socket to interrupt any blocking recvfrom calls
+        try:
+            if self.sock:
+                self.sock.close()
+                self.log("Socket closed")
+        except Exception as e:
+            self.log(f"Error closing socket: {e}")
+        
+        # Wait for threads to finish (with timeout)
+        for thread in self.threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        
+        # Clear data structures to free memory
+        with self.lock:
+            self.peers.clear()
+            self.seen_messages.clear()
+            self.gossip_reception_times.clear()
+            self.pending_pings.clear()
+        
+        self.log("Node stopped successfully")
+
+    def send_gossip(self, text):
+        """Send a gossip message to the network."""
         payload = {
             "topic": "custom",
             "data": text,
@@ -338,75 +396,76 @@ class GossipNode:
         self.forward_gossip(gossip_msg, self.ttl)
         self.log(f"Initiated GOSSIP: '{text}'")
 
-
     def cli_loop(self):
         """Interactive CLI for gossip, peers, ping, stats, help, exit."""
         print("\nCommands: gossip <msg> | peers | ping <addr> | stats | help | exit\n")
-        while True:
+        while self.running:
             try:
-                cmd = input()
-                if cmd.startswith("gossip "):
-                    text = cmd.split("gossip ", 1)[1]
-                    payload = {
-                        "topic": "custom",
-                        "data": text,
-                        "origin_id": self.node_id,
-                        "origin_timestamp_ms": int(time.time() * 1000)
-                    }
-                    gossip_msg = MessageBuilder.build('GOSSIP', self.node_id, self.self_addr, payload, self.ttl)
-
-                    self.seen_messages.add(gossip_msg['msg_id'])
-
-                    self.forward_gossip(gossip_msg, self.ttl)
-                    self.log(f"Initiated GOSSIP: '{text}'")
-
-                elif cmd == "peers":
-                    with self.lock:
-                        print(f"Current Peers ({len(self.peers)}/{self.peer_limit}):")
-                        for addr, data in self.peers.items():
-                            idle_time = int(time.time() - data['last_seen'])
-                            print(f"  - {addr} (ID: {data['node_id'][:8]}..., Idle: {idle_time}s)")
+                # Use non-blocking input with timeout to check running flag
+                import sys
+                import select
                 
-                elif cmd.startswith("ping "):
-                    addr = cmd.split("ping ", 1)[1].strip()
-                    if not addr:
-                        self.log("Usage: ping <addr>  e.g. ping 127.0.0.1:8001")
+                # Check if there's input available (with timeout)
+                if sys.stdin in select.select([sys.stdin], [], [], 0.5)[0]:
+                    cmd = sys.stdin.readline().strip()
+                    if not cmd:
                         continue
-                    with self.lock:
-                        if addr not in self.peers:
-                            self.log(f"Unknown peer: {addr}. Use 'peers' to list addresses.")
-                            continue
-                        # Increment failed_pings counter (will be reset when PONG received)
-                        self.peers[addr]['failed_pings'] = self.peers[addr].get('failed_pings', 0) + 1
-                        failed_count = self.peers[addr]['failed_pings']
-                    ping_id = str(uuid.uuid4())
-                    sent_ms = int(time.time() * 1000)
-                    with self.lock:
-                        self.pending_pings[ping_id] = (addr, sent_ms)
-                    ping_msg = MessageBuilder.build(
-                        'PING', self.node_id, self.self_addr,
-                        {"ping_id": ping_id, "seq": 0}, self.ttl
-                    )
-                    self.send_udp(addr, ping_msg)
-                    self.log(f"Sent PING to {addr} (ping_id={ping_id[:8]}..., failed_pings={failed_count})")
+                        
+                    if cmd.startswith("gossip "):
+                        text = cmd.split("gossip ", 1)[1]
+                        self.send_gossip(text)
 
-                elif cmd == "stats":
-                    with self.lock:
-                        print(f"\nNode Statistics:")
-                        print(f"  Node ID: {self.node_id}")
-                        print(f"  Address: {self.self_addr}")
-                        print(f"  Peers: {len(self.peers)}/{self.peer_limit}")
-                        print(f"  Seen Messages: {len(self.seen_messages)}")
-                        print(f"  Gossip Messages Received: {len(self.gossip_reception_times)}")
-                        if self.gossip_reception_times:
-                            oldest = min(self.gossip_reception_times.values())
-                            newest = max(self.gossip_reception_times.values())
-                            print(f"  Gossip Reception Range: {newest - oldest}ms")
-                elif cmd == "help":
-                    print("\nCommands: gossip <msg> | peers | ping <addr> | stats | help | exit\n")
-                elif cmd == "exit":
-                    self.log("Shutting down...")
-                    break
+                    elif cmd == "peers":
+                        with self.lock:
+                            print(f"Current Peers ({len(self.peers)}/{self.peer_limit}):")
+                            for addr, data in self.peers.items():
+                                idle_time = int(time.time() - data['last_seen'])
+                                print(f"  - {addr} (ID: {data['node_id'][:8]}..., Idle: {idle_time}s)")
+                    
+                    elif cmd.startswith("ping "):
+                        addr = cmd.split("ping ", 1)[1].strip()
+                        if not addr:
+                            self.log("Usage: ping <addr>  e.g. ping 127.0.0.1:8001")
+                            continue
+                        with self.lock:
+                            if addr not in self.peers:
+                                self.log(f"Unknown peer: {addr}. Use 'peers' to list addresses.")
+                                continue
+                            # Increment failed_pings counter (will be reset when PONG received)
+                            self.peers[addr]['failed_pings'] = self.peers[addr].get('failed_pings', 0) + 1
+                            failed_count = self.peers[addr]['failed_pings']
+                        ping_id = str(uuid.uuid4())
+                        sent_ms = int(time.time() * 1000)
+                        with self.lock:
+                            self.pending_pings[ping_id] = (addr, sent_ms)
+                        ping_msg = MessageBuilder.build(
+                            'PING', self.node_id, self.self_addr,
+                            {"ping_id": ping_id, "seq": 0}, self.ttl
+                        )
+                        self.send_udp(addr, ping_msg)
+                        self.log(f"Sent PING to {addr} (ping_id={ping_id[:8]}..., failed_pings={failed_count})")
+
+                    elif cmd == "stats":
+                        with self.lock:
+                            print(f"\nNode Statistics:")
+                            print(f"  Node ID: {self.node_id}")
+                            print(f"  Address: {self.self_addr}")
+                            print(f"  Peers: {len(self.peers)}/{self.peer_limit}")
+                            print(f"  Seen Messages: {len(self.seen_messages)}")
+                            print(f"  Gossip Messages Received: {len(self.gossip_reception_times)}")
+                            if self.gossip_reception_times:
+                                oldest = min(self.gossip_reception_times.values())
+                                newest = max(self.gossip_reception_times.values())
+                                print(f"  Gossip Reception Range: {newest - oldest}ms")
+                    elif cmd == "help":
+                        print("\nCommands: gossip <msg> | peers | ping <addr> | stats | help | exit\n")
+                    elif cmd == "exit":
+                        self.log("Shutting down...")
+                        self.stop()
+                        break
             except KeyboardInterrupt:
                 print("\nExiting...")
+                self.stop()
                 break
+            except Exception as e:
+                self.log(f"CLI error: {e}")
