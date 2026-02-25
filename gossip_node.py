@@ -1,8 +1,10 @@
 """
 Gossip protocol node: UDP listener, peer management, and message routing.
-Handles HELLO, GET_PEERS, PEERS_LIST, PING/PONG, and GOSSIP message types.
+Handles HELLO, GET_PEERS, PEERS_LIST, PING/PONG, GOSSIP, IHAVE, IWANT (Phase 4).
+Phase 4: Hybrid push-pull (IHAVE/IWANT) and Sybil resistance (PoW on HELLO).
 """
 
+import hashlib
 import json
 import random
 import socket
@@ -20,7 +22,8 @@ class GossipNode:
     maintains peer list with PING/timeout, and routes/forwards GOSSIP messages.
     """
 
-    def __init__(self, port, bootstrap, fanout, ttl, peer_limit, ping_interval, peer_timeout, seed, *args, **kwargs):
+    def __init__(self, port, bootstrap, fanout, ttl, peer_limit, ping_interval, peer_timeout, seed,
+                 mode='push_only', interval_pull=5.0, ids_max_ihave=32, k_pow=0, *args, **kwargs):
         # Identity and bind address
         self.node_id = str(uuid.uuid4())
         self.host = '127.0.0.1'
@@ -34,6 +37,12 @@ class GossipNode:
         self.peer_limit = peer_limit
         self.ping_interval = ping_interval
         self.peer_timeout = peer_timeout
+        # Phase 4: Hybrid push-pull
+        self.mode = mode if mode in ('push_only', 'hybrid_push_pull') else 'push_only'
+        self.interval_pull = float(interval_pull)
+        self.ids_max_ihave = max(1, int(ids_max_ihave))
+        # Phase 4: Sybil resistance
+        self.k_pow = max(0, int(k_pow))
 
         self.ping_seqs = {}
 
@@ -49,6 +58,17 @@ class GossipNode:
         # pending_pings: {ping_id: (addr, sent_time_ms)} for CLI ping -> PONG round-trip
         self.pending_pings = {}
         self.lock = threading.Lock()
+
+        # Phase 4: message cache for IWANT responses (bounded)
+        self._message_cache_max = 500
+        self.message_cache = {}  # msg_id -> full GOSSIP message dict
+        self._message_cache_order = []  # FIFO for eviction
+        # Phase 4: counts for logging/analysis
+        self.ihave_sent = 0
+        self.ihave_received = 0
+        self.iwant_sent = 0
+        self.iwant_received = 0
+        self.hello_rejected_pow = 0
 
         # Control flags for thread shutdown
         self.running = False
@@ -76,6 +96,84 @@ class GossipNode:
             self.sock.sendto(data, (ip, port))
         except Exception as e:
             self.log(f"Error sending to {target_addr}: {e}")
+
+    # ---------- Phase 4: Message cache (for IWANT responses) ----------
+    def _store_gossip_in_cache(self, msg_id, full_gossip_msg):
+        """Store a full GOSSIP message by msg_id; evict oldest if over limit."""
+        if not msg_id or not full_gossip_msg:
+            return
+        with self.lock:
+            if msg_id in self.message_cache:
+                return
+            while len(self.message_cache) >= self._message_cache_max and self._message_cache_order:
+                old_id = self._message_cache_order.pop(0)
+                self.message_cache.pop(old_id, None)
+            self.message_cache[msg_id] = full_gossip_msg
+            self._message_cache_order.append(msg_id)
+
+    # ---------- Phase 4: PoW (Sybil resistance) ----------
+    @staticmethod
+    def _pow_digest(node_id, nonce):
+        """H(node_id || nonce) as hex; use sha256."""
+        data = f"{node_id}{nonce}".encode('utf-8')
+        return hashlib.sha256(data).hexdigest()
+
+    def validate_pow_on_hello(self, hello_msg):
+        """
+        Validate PoW in HELLO payload. If k_pow > 0, payload must contain pow with
+        digest_hex = H(sender_id || nonce) with k_pow leading zero hex chars.
+        Returns True if valid (or k_pow==0), False otherwise.
+        """
+        if self.k_pow <= 0:
+            return True
+        payload = hello_msg.get('payload') or {}
+        pow_data = payload.get('pow')
+        if not isinstance(pow_data, dict):
+            return False
+        sender_id = hello_msg.get('sender_id')
+        if not sender_id:
+            return False
+        difficulty_k = pow_data.get('difficulty_k')
+        if difficulty_k != self.k_pow:
+            return False
+        nonce = pow_data.get('nonce')
+        digest_hex = pow_data.get('digest_hex')
+        if nonce is None or not digest_hex:
+            return False
+        expected = self._pow_digest(sender_id, nonce)
+        if not expected.startswith('0' * self.k_pow):
+            return False
+        if expected != digest_hex:
+            return False
+        return True
+
+    def compute_pow(self, node_id=None):
+        """
+        Find nonce such that H(node_id || nonce) starts with k_pow leading zero hex chars.
+        Returns dict: hash_alg, difficulty_k, nonce, digest_hex. If k_pow==0, returns minimal valid pow.
+        """
+        node_id = node_id or self.node_id
+        if self.k_pow <= 0:
+            nonce = 0
+            digest = self._pow_digest(node_id, nonce)
+            return {"hash_alg": "sha256", "difficulty_k": 0, "nonce": nonce, "digest_hex": digest}
+        prefix = '0' * self.k_pow
+        nonce = 0
+        while True:
+            digest = self._pow_digest(node_id, nonce)
+            if digest.startswith(prefix):
+                return {"hash_alg": "sha256", "difficulty_k": self.k_pow, "nonce": nonce, "digest_hex": digest}
+            nonce += 1
+
+    def _build_hello_payload(self):
+        """Build HELLO payload (capabilities + optional PoW for Phase 4)."""
+        payload = {"capabilities": ["udp", "json"]}
+        if self.k_pow > 0:
+            t0 = time.perf_counter()
+            payload["pow"] = self.compute_pow()
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            self.log(f"PoW computed in {elapsed_ms:.2f} ms (k_pow={self.k_pow})")
+        return payload
 
     # ---------- Network and message handling ----------
     def listen_thread(self):
@@ -164,13 +262,20 @@ class GossipNode:
         payload = msg.get('payload', {})
 
         if m_type == 'HELLO':
+            # Phase 4: Validate PoW before accepting HELLO
+            if not self.validate_pow_on_hello(msg):
+                with self.lock:
+                    self.hello_rejected_pow += 1
+                self.log(f"HELLO rejected from {s_addr}: invalid or missing PoW (k_pow={self.k_pow})")
+                return
             # Add sender as peer (with replacement policy if needed)
             # Only send HELLO back if peer was newly added to avoid infinite loops
             was_new = self._add_peer(s_addr, s_id)
             if was_new:
                 self.log(f"New peer added from HELLO: {s_addr}")
-                # Send HELLO back to establish bidirectional connection (only for new peers)
-                hello_response = MessageBuilder.build('HELLO', self.node_id, self.self_addr, {"capabilities": ["udp", "json"]}, self.ttl)
+                # Send HELLO back (with PoW if k_pow > 0)
+                hello_payload = self._build_hello_payload()
+                hello_response = MessageBuilder.build('HELLO', self.node_id, self.self_addr, hello_payload, self.ttl)
                 self.send_udp(s_addr, hello_response)
 
         elif m_type == 'GET_PEERS':
@@ -197,9 +302,15 @@ class GossipNode:
                     was_new = self._add_peer(p_addr, p_node_id)
                     if was_new:
                         self.log(f"Discovered new peer via PEERS_LIST: {p_addr}")
-                        # Only send HELLO to newly discovered peers
-                        hello_msg = MessageBuilder.build('HELLO', self.node_id, self.self_addr, {"capabilities": ["udp", "json"]}, self.ttl)
+                        hello_payload = self._build_hello_payload()
+                        hello_msg = MessageBuilder.build('HELLO', self.node_id, self.self_addr, hello_payload, self.ttl)
                         self.send_udp(p_addr, hello_msg)
+
+        elif m_type == 'IHAVE':
+            self._handle_ihave(msg, s_addr)
+
+        elif m_type == 'IWANT':
+            self._handle_iwant(msg, s_addr)
 
         elif m_type == 'PING':
             # Answer with PONG carrying same ping_id and seq (per protocol)
@@ -234,6 +345,9 @@ class GossipNode:
             if msg_id in self.seen_messages:
                 return
 
+            # Store in cache for Phase 4 IWANT responses (before adding to seen to keep one copy)
+            self._store_gossip_in_cache(msg_id, msg)
+
             # Store reception time for Phase 3 analysis
             reception_time_ms = int(time.time() * 1000)
             with self.lock:
@@ -265,6 +379,74 @@ class GossipNode:
         for p_addr in selected_peers:
             self.send_udp(p_addr, forward_msg)
             self.log(f"Forwarded GOSSIP to {p_addr}")
+
+    # ---------- Phase 4: IHAVE / IWANT ----------
+    def _handle_ihave(self, msg, sender_addr):
+        """Compare IHAVE ids with SeenSet; request missing ids via IWANT."""
+        with self.lock:
+            self.ihave_received += 1
+        payload = msg.get('payload') or {}
+        ids = payload.get('ids')
+        if not isinstance(ids, list):
+            return
+        with self.lock:
+            missing = [mid for mid in ids if mid not in self.seen_messages]
+        if not missing:
+            return
+        iwant_payload = {"ids": missing}
+        iwant_msg = MessageBuilder.build('IWANT', self.node_id, self.self_addr, iwant_payload, self.ttl)
+        self.send_udp(sender_addr, iwant_msg)
+        with self.lock:
+            self.iwant_sent += 1
+        self.log(f"IHAVE from {sender_addr}: requested {len(missing)} missing via IWANT")
+
+    def _handle_iwant(self, msg, sender_addr):
+        """Respond to IWANT by sending full GOSSIP messages for requested ids we have in cache."""
+        with self.lock:
+            self.iwant_received += 1
+        payload = msg.get('payload') or {}
+        ids = payload.get('ids')
+        if not isinstance(ids, list):
+            return
+        for mid in ids:
+            with self.lock:
+                full_msg = self.message_cache.get(mid)
+            if not full_msg:
+                continue
+            # Re-send as GOSSIP (same format: msg_id, payload, ttl)
+            current_ttl = full_msg.get('ttl', self.ttl)
+            if current_ttl <= 0:
+                continue
+            gossip_msg = MessageBuilder.build(
+                'GOSSIP', self.node_id, self.self_addr,
+                full_msg.get('payload', {}), current_ttl, msg_id=full_msg.get('msg_id')
+            )
+            self.send_udp(sender_addr, gossip_msg)
+        if ids:
+            self.log(f"IWANT from {sender_addr}: sent {len([mid for mid in ids if self.message_cache.get(mid)])} GOSSIP(es)")
+
+    def _periodic_send_ihave(self):
+        """Send IHAVE to some peers every interval_pull (only in hybrid mode)."""
+        self.log("IHAVE periodic thread started...")
+        while self.running:
+            time.sleep(self.interval_pull)
+            if self.mode != 'hybrid_push_pull':
+                continue
+            with self.lock:
+                peer_addrs = list(self.peers.keys())
+                ids = list(self.seen_messages)[: self.ids_max_ihave]
+            if not peer_addrs or not ids:
+                continue
+            n_peers = min(self.fanout, len(peer_addrs))
+            chosen = random.sample(peer_addrs, n_peers)
+            payload = {"ids": ids, "max_ids": self.ids_max_ihave}
+            ihave_msg = MessageBuilder.build('IHAVE', self.node_id, self.self_addr, payload, self.ttl)
+            for p_addr in chosen:
+                self.send_udp(p_addr, ihave_msg)
+                with self.lock:
+                    self.ihave_sent += 1
+            self.log(f"Sent IHAVE to {len(chosen)} peer(s) with {len(ids)} id(s)")
+        self.log("IHAVE periodic thread stopped")
 
     # ---------- Periodic maintenance ----------
     def periodic_thread(self):
@@ -342,9 +524,15 @@ class GossipNode:
         t3.start()
         self.threads.append(t3)
 
+        if self.mode == 'hybrid_push_pull':
+            t4 = threading.Thread(target=self._periodic_send_ihave, daemon=True)
+            t4.start()
+            self.threads.append(t4)
+
         if self.bootstrap and self.bootstrap != self.self_addr:
             self.log(f"Bootstrapping via {self.bootstrap}...")
-            hello_msg = MessageBuilder.build('HELLO', self.node_id, self.self_addr, {"capabilities": ["udp", "json"]}, self.ttl)
+            hello_payload = self._build_hello_payload()
+            hello_msg = MessageBuilder.build('HELLO', self.node_id, self.self_addr, hello_payload, self.ttl)
             self.send_udp(self.bootstrap, hello_msg)
 
             time.sleep(0.5)
@@ -390,6 +578,7 @@ class GossipNode:
         }
         gossip_msg = MessageBuilder.build('GOSSIP', self.node_id, self.self_addr, payload, self.ttl)
 
+        self._store_gossip_in_cache(gossip_msg['msg_id'], gossip_msg)
         self.seen_messages.add(gossip_msg['msg_id'])
 
         self.forward_gossip(gossip_msg, self.ttl)
@@ -456,6 +645,10 @@ class GossipNode:
                                 oldest = min(self.gossip_reception_times.values())
                                 newest = max(self.gossip_reception_times.values())
                                 print(f"  Gossip Reception Range: {newest - oldest}ms")
+                            print(f"  Mode: {self.mode}")
+                            print(f"  IHAVE sent/received: {self.ihave_sent}/{self.ihave_received}")
+                            print(f"  IWANT sent/received: {self.iwant_sent}/{self.iwant_received}")
+                            print(f"  HELLO rejected (PoW): {self.hello_rejected_pow}")
                     elif cmd == "help":
                         print("\nCommands: gossip <msg> | peers | ping <addr> | stats | help | exit\n")
                     elif cmd == "exit":
