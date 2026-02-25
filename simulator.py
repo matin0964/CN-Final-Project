@@ -45,7 +45,7 @@ class SimulatedNode(GossipNode):
                 # Check if this is first time receiving gossip
                 if self.has_received_gossip == 0:
                     self.has_received_gossip = 1
-                    self.reception_time = self.simulator.current_hop if self.simulator else 0
+                    self.reception_time = time.time()
                     # Notify simulator about new reception
                     if self.simulator:
                         self.simulator.node_received_gossip(self.self_addr, self.reception_time)
@@ -63,7 +63,7 @@ class GossipNetworkSimulator:
         self.total_messages = 0
         self.target_count = math.ceil(n_nodes * 0.95)
         self.timeout_seconds = timeout_seconds
-        self.current_hop = 0
+        self.ttl = ttl
         
         # Track reception times
         self.reception_times = {}  # node_addr -> hop_received
@@ -73,8 +73,8 @@ class GossipNetworkSimulator:
         # Create nodes
         prev_node = None
         for i in range(n_nodes):
-            port = 28400 + i
-            node = SimulatedNode(port, prev_node.self_addr if prev_node != None else None, fanout, ttl, n_nodes, 10, 60, seed)
+            port = 20000 + i
+            node = SimulatedNode(port, prev_node.self_addr if prev_node != None else None, fanout, ttl, n_nodes, 10, 60, seed + port)
             node.simulator = self
             self.nodes[node.self_addr] = node
             prev_node = node
@@ -84,33 +84,42 @@ class GossipNetworkSimulator:
         if target_addr in self.nodes:
             self.nodes[target_addr].handle_message(msg)
 
-    def node_received_gossip(self, node_addr, hop):
+    def node_received_gossip(self, node_addr, time):
         """Callback when a node receives gossip for the first time"""
         with self.reception_lock:
             if node_addr not in self.reception_times:
-                self.reception_times[node_addr] = hop
+                self.reception_times[node_addr] = time
                 
                 # Check if we've reached target
                 if len(self.reception_times) >= self.target_count:
                     self.simulation_complete.set()
 
-    def send_initial_gossip(self, seed_node_addr):
+    def send_initial_gossip(self, seed_node_addr, ttl, original_time):
         """Send gossip from a seed node to start the simulation"""
+
         if seed_node_addr in self.nodes:
             # Create a gossip message
-            gossip_msg = {
-                'msg_type': 'GOSSIP',
-                'msg_id': str(uuid.uuid4()),
-                'origin': seed_node_addr,
-                'content': 'SIMULATION_START',
-                'ttl': self.nodes[seed_node_addr].ttl
-            }
+            seed_node = self.nodes[seed_node_addr]
+
+            payload = {
+                "topic":"tea",
+                "data":"fr fr",
+                "origin_id":seed_node.node_id,
+                "origin_timestamp_ms":original_time
+                }
+
+            gossip_msg =  MessageBuilder.build(msg_type='GOSSIP',
+                                 sender_id=seed_node.node_id, 
+                                 sender_addr= seed_node.self_addr,
+                                 payload= payload,
+                                 ttl=ttl,
+                                )
             
             # Mark seed node as having received gossip at hop 0
-            self.node_received_gossip(seed_node_addr, 0)
+            self.node_received_gossip(seed_node_addr, original_time)
             
             # Have the seed node process the message (which will trigger forwarding)
-            self.nodes[seed_node_addr].handle_message(gossip_msg)
+            seed_node.handle_message(gossip_msg)
 
     def run(self):
         """
@@ -135,7 +144,6 @@ class GossipNetworkSimulator:
         # Clear any existing reception data
         self.reception_times.clear()
         self.total_messages = 0
-        self.current_hop = 0
         self.simulation_complete.clear()
         
         # Select a random seed node to start the gossip
@@ -143,17 +151,17 @@ class GossipNetworkSimulator:
         print(f"Seed node: {seed_node_addr}")
         
         # Send initial gossip
-        self.send_initial_gossip(seed_node_addr)
+        start_time = time.time()
+        self.send_initial_gossip(seed_node_addr, self.ttl, start_time)
         
         # Track propagation over time
-        start_time = time.time()
+        
         hop_check_interval = 0.1  # Check every 100ms
         max_hops = self.nodes[seed_node_addr].ttl * 2  # Upper bound on hops
         
         # Monitor propagation
         while (time.time() - start_time) < self.timeout_seconds:
             time.sleep(hop_check_interval)
-            self.current_hop += 1
             
             # Check if we've reached target
             with self.reception_lock:
@@ -168,7 +176,7 @@ class GossipNetworkSimulator:
         if len(reception_list) >= self.target_count:
             # Sort reception times and find when we hit target
             reception_list.sort()
-            conv_time = reception_list[self.target_count - 1]  # Hop when target reached
+            conv_time = reception_list[self.target_count - 1] - reception_list[0] # Hop when target reached
         else:
             conv_time = "Diverged"
         
@@ -225,6 +233,7 @@ if __name__ == "__main__":
         # Print progress
         print(f"Completed simulation for N={n}: {result['coverage']} coverage, {result['msgs']} total messages")
         print("-" * 80)
+        time.sleep(5)
 
     # Print Comparison Chart
     print(f"\nGossip Simulation Results (Fanout={FANOUT}, TTL={TTL})")
