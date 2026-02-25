@@ -297,10 +297,10 @@ if __name__ == "__main__":
     
     # Print summary table
     print("\n" + "="*50)
-    print(f"{'N':<10} | {'Avg Msgs':<15} | {'Avg Conv (s)':<15}")
+    print(f"{'N':<10} | {'Avg Msgs':<15} | {'Avg Gossips':<15} | {'Avg Conv (s)':<15}")
     print("-" * 50)
     for data in bench_data:
-        print(f"{data['n']:<10} | {data['avg_msgs']:<15.2f} | {data['avg_conv']:<15.4f}")
+        print(f"{data['n']:<10} | {data['avg_msgs']:<15.2f} | {data['avg_gossip']:<15.2f} | {data['avg_conv']:<15.4f}")
     print("\n" + "="*50)
     print("\n\n")
     plot_results(bench_data, 
