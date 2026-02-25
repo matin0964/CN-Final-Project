@@ -25,15 +25,17 @@ class SimulatedNode(GossipNode):
     # def log(self, message):
     #     pass  # Suppress logs during bulk simulation
 
-    def send_udp(self, target_addr, message_dict):
-        self.messages_sent_count += 1
-        if self.simulator:
-            self.simulator.deliver_message(target_addr, message_dict)
+    # def send_udp(self, target_addr, message_dict):
+    #     self.messages_sent_count += 1
+    #     if self.simulator:
+    #         self.simulator.deliver_message(target_addr, message_dict)
 
     def handle_message(self, msg):
         if not isinstance(msg, dict):
             self.log(f"Invalid message: not a dictionary")
             return
+
+        self.simulator.total_messages += 1
         
         m_type = msg.get('msg_type')
         if not m_type:
@@ -41,6 +43,7 @@ class SimulatedNode(GossipNode):
             return
 
         if m_type == 'GOSSIP':
+            self.simulator.total_gossip_msg += 1
             with self.lock:
                 # Check if this is first time receiving gossip
                 if self.has_received_gossip == 0:
@@ -61,6 +64,7 @@ class GossipNetworkSimulator:
         self.n_nodes = n_nodes
         self.nodes = {}
         self.total_messages = 0
+        self.total_gossip_msg = 0
         self.target_count = math.ceil(n_nodes * 0.95)
         self.timeout_seconds = timeout_seconds
         self.ttl = ttl
@@ -197,6 +201,7 @@ class GossipNetworkSimulator:
             "reached": len(self.reception_times),
             "conv_time": conv_time,
             "msgs": self.total_messages,
+            "gossip_msges": self.total_gossip_msg,
             "msgs_per_node": round(messages_per_node, 2),
             "coverage": f"{len(self.reception_times)/self.n_nodes*100:.1f}%"
         }
@@ -238,10 +243,10 @@ if __name__ == "__main__":
     # Print Comparison Chart
     print(f"\nGossip Simulation Results (Fanout={FANOUT}, TTL={TTL})")
     print("=" * 80)
-    print(f"{'Nodes (N)':<10} | {'Reached':<12} | {'Coverage':<10} | {'Conv. Time':<12} | {'Total Msgs':<12} | {'Msgs/Node':<10}")
+    print(f"{'Nodes (N)':<10} | {'Reached':<12} | {'Coverage':<10} | {'Conv. Time':<12} | {'Total Msgs':<12} | {'Gossip Msgs':<12} |{'Msgs/Node':<10}")
     print("-" * 80)
     
     for r in results:
         reached_str = f"{r['reached']}/{r['n']}"
-        print(f"{r['n']:<10} | {reached_str:<12} | {r['coverage']:<10} | {str(r['conv_time']):<12} | {r['msgs']:<12} | {r['msgs_per_node']:<10}")
+        print(f"{r['n']:<10} | {reached_str:<12} | {r['coverage']:<10} | {str(r['conv_time']):<12} | {r['msgs']:<12} | {r['gossip_msges']:<12} | {r['msgs_per_node']:<10}")
     print("=" * 80)
