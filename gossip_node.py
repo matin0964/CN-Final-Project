@@ -370,14 +370,8 @@ class GossipNode:
         # Wait for threads to finish (with timeout)
         for thread in self.threads:
             if thread.is_alive():
-                thread.join(timeout=2.0)
+                thread.join(timeout=0.1)
         
-        # Clear data structures to free memory
-        with self.lock:
-            self.peers.clear()
-            self.seen_messages.clear()
-            self.gossip_reception_times.clear()
-            self.pending_pings.clear()
         
         self.log("Node stopped successfully")
 
