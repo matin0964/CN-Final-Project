@@ -141,7 +141,7 @@ class GossipNetworkSimulator:
         # Start all nodes
         for node in self.nodes.values():
             node.start()
-            time.sleep(0.2)
+            time.sleep(0.4)
         
         # Wait a bit for initialization
         time.sleep(2)
@@ -184,6 +184,7 @@ class GossipNetworkSimulator:
             reception_list.sort()
             conv_time = reception_list[self.target_count - 1] - reception_list[0] # Hop when target reached
         else:
+            print("TIMEOUT")
             conv_time = "Diverged"
         
         # Calculate message efficiency
@@ -211,12 +212,9 @@ class GossipNetworkSimulator:
         return results
 
 
-def run_benchmarks():
+def run_benchmarks(FANOUT=3, TTL=10, TIMEOUT=15):
     N_VALUES = [10, 20, 50]  # Different network sizes
-    SEEDS = [10, 20, 30, 40, 50]      # 5 different seeds
-    FANOUT = 3
-    TTL = 10
-    TIMEOUT = 15
+    SEEDS = [10]      # 5 different seeds
 
     final_results = []
 
@@ -239,7 +237,7 @@ def run_benchmarks():
                 seed_runs.append(res)
             
             # Brief cooldown to let threads/ports clear
-            time.sleep(2)
+            time.sleep(4)
 
         # Aggregate results for this N
         if seed_runs:
@@ -258,7 +256,7 @@ def run_benchmarks():
 
     return final_results
 
-def plot_results(results):
+def plot_results(results, fanout, ttl):
     ns = [r['n'] for r in results]
     msgs = [r['avg_msgs'] for r in results]
     conv_times = [r['avg_conv'] for r in results]
@@ -282,10 +280,20 @@ def plot_results(results):
 
     plt.title('Gossip Protocol Scalability: Messages & Convergence vs N')
     fig.tight_layout()
+
+    plt.savefig(f'gossip_simulation_results_ttl:{ttl}_fanout:{fanout}.png', dpi=300, bbox_inches='tight')
+    print("Chart saved as gossip_simulation_results.png")
+
     plt.show()
 
 if __name__ == "__main__":
-    bench_data = run_benchmarks()
+    FANOUT = 3
+    TTL = 10
+    TIME_OUT= 30   
+    bench_data = run_benchmarks( FANOUT=FANOUT,
+                                 TTL=TTL,
+                                 TIMEOUT=TIME_OUT
+                                )
     
     # Print summary table
     print("\n" + "="*50)
@@ -295,4 +303,6 @@ if __name__ == "__main__":
         print(f"{data['n']:<10} | {data['avg_msgs']:<15.2f} | {data['avg_conv']:<15.4f}")
     print("\n" + "="*50)
     print("\n\n")
-    plot_results(bench_data)
+    plot_results(bench_data, 
+                 FANOUT, 
+                 TTL)
