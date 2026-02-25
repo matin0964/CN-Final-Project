@@ -20,7 +20,7 @@ class GossipNode:
     maintains peer list with PING/timeout, and routes/forwards GOSSIP messages.
     """
 
-    def __init__(self, port, bootstrap, fanout, ttl, peer_limit, ping_interval, peer_timeout, seed):
+    def __init__(self, port, bootstrap, fanout, ttl, peer_limit, ping_interval, peer_timeout, seed, *args, **kwargs):
         # Identity and bind address
         self.node_id = str(uuid.uuid4())
         self.host = '127.0.0.1'
@@ -34,6 +34,8 @@ class GossipNode:
         self.peer_limit = peer_limit
         self.ping_interval = ping_interval
         self.peer_timeout = peer_timeout
+
+        self.ping_seqs = {}
 
         random.seed(seed)
 
@@ -312,11 +314,14 @@ class GossipNode:
             ping_id = str(uuid.uuid4())
             self.pending_pings[ping_id] = (addr, int(time.time() * 1000))
             
+            prev = self.ping_seqs.get(addr)
+            seq = self.ping_seqs[addr] = prev + 1 if prev != None else 0
+
+
             ping_msg = MessageBuilder.build(
                 'PING', self.node_id, self.self_addr,
-                {"ping_id": ping_id, "seq": 0}, self.ttl
+                {"ping_id": ping_id, "seq":seq }, self.ttl
             )
-        
         self.send_udp(addr, ping_msg)
 
     # ---------- Bootstrap and CLI ----------

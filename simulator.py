@@ -4,9 +4,8 @@ import math
 import random
 import collections
 import threading
+import statistics
 import matplotlib.pyplot as plt
-import numpy as np
-from collections import defaultdict
 
 # Importing your logic (Assuming these are in the same directory or defined above)
 from gossip_node import GossipNode
@@ -17,21 +16,13 @@ class SimulatedNode(GossipNode):
     Overrides the UDP layer of your GossipNode to facilitate 
     in-memory message passing for the simulation.
     """
-    def __init__(self, *args, **kwargs):
+    def __init__(self,simulator, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.simulator = None
+        self.simulator = simulator
         self.messages_sent_count = 0
         self.has_received_gossip = 0
         self.lock = threading.Lock()
         self.reception_time = None  # Track when node first received gossip
-
-    # def log(self, message):
-    #     pass  # Suppress logs during bulk simulation
-
-    # def send_udp(self, target_addr, message_dict):
-    #     self.messages_sent_count += 1
-    #     if self.simulator:
-    #         self.simulator.deliver_message(target_addr, message_dict)
 
     def handle_message(self, msg):
         if not isinstance(msg, dict):
@@ -81,7 +72,15 @@ class GossipNetworkSimulator:
         prev_node = None
         for i in range(n_nodes):
             port = 20000 + i
-            node = SimulatedNode(port, prev_node.self_addr if prev_node != None else None, fanout, ttl, n_nodes, 10, 60, seed + port)
+            node = SimulatedNode( self, 
+                                  port, 
+                                  prev_node.self_addr if prev_node != None else None, 
+                                  fanout, 
+                                  ttl, 
+                                  n_nodes, 
+                                  10, 
+                                  60, 
+                                  seed + port)
             node.simulator = self
             self.nodes[node.self_addr] = node
             prev_node = node
@@ -137,31 +136,34 @@ class GossipNetworkSimulator:
         4. Wait for propagation or timeout
         5. Return results
         """
-        print(f"  Running simulation with {self.n_nodes} nodes (seed-based)...")
+        print(f"Starting simulation with {self.n_nodes} nodes...")
         
         # Start all nodes
         for node in self.nodes.values():
             node.start()
-            time.sleep(0.1)  # Reduced sleep for faster simulation
+            time.sleep(0.2)
         
         # Wait a bit for initialization
-        time.sleep(1)
+        time.sleep(2)
+        print("sending gossip msg...")
         
         # Clear any existing reception data
         self.reception_times.clear()
         self.total_messages = 0
-        self.total_gossip_msg = 0
         self.simulation_complete.clear()
         
         # Select a random seed node to start the gossip
         seed_node_addr = random.choice(list(self.nodes.keys()))
+        print(f"Seed node: {seed_node_addr}")
         
         # Send initial gossip
         start_time = time.time()
         self.send_initial_gossip(seed_node_addr, self.ttl, start_time)
         
         # Track propagation over time
+        
         hop_check_interval = 0.1  # Check every 100ms
+        max_hops = self.nodes[seed_node_addr].ttl * 2  # Upper bound on hops
         
         # Monitor propagation
         while (time.time() - start_time) < self.timeout_seconds:
@@ -171,6 +173,7 @@ class GossipNetworkSimulator:
             with self.reception_lock:
                 current_reached = len(self.reception_times)
                 if current_reached >= self.target_count:
+                    print(f"Target reached: {current_reached}/{self.n_nodes} nodes")
                     break
         
         # Calculate convergence metrics
@@ -179,19 +182,20 @@ class GossipNetworkSimulator:
         if len(reception_list) >= self.target_count:
             # Sort reception times and find when we hit target
             reception_list.sort()
-            conv_time = reception_list[self.target_count - 1] - reception_list[0]  # Time when target reached
+            conv_time = reception_list[self.target_count - 1] - reception_list[0] # Hop when target reached
         else:
-            conv_time = float('nan')  # Use NaN for diverged cases
+            conv_time = "Diverged"
         
         # Calculate message efficiency
         messages_per_node = self.total_messages / self.n_nodes if self.n_nodes > 0 else 0
         
         # Stop all nodes
+        print("Stopping all nodes...")
         for node in self.nodes.values():
             node.stop()
         
         # Wait for threads to finish
-        time.sleep(0.5)
+        time.sleep(1)
         
         # Compile results
         results = {
@@ -207,193 +211,88 @@ class GossipNetworkSimulator:
         return results
 
 
-def run_multiple_seeds(n_values, fanout, ttl, timeout, num_seeds=5):
-    """
-    Run simulations for each N with multiple seed values and combine results
-    """
-    all_results = defaultdict(list)
-    
-    print("=" * 50)
-    print(f"GOSSIP PROTOCOL SIMULATION WITH {num_seeds} DIFFERENT SEEDS PER CONFIGURATION")
-    print("=" * 50)
-    
-    for n in n_values:
-        print(f"\n--- Processing N = {n} nodes ---")
-        
-        for seed_idx in range(num_seeds):
-            # Use different seed for each run
-            base_seed = 1000 * n + seed_idx * 100  # Different seed per run
-            
-            print(f"  Run {seed_idx + 1}/{num_seeds} (seed={base_seed})...")
-            
-            sim = GossipNetworkSimulator(
-                n_nodes=n, 
-                fanout=fanout, 
-                ttl=ttl, 
-                timeout_seconds=timeout,
-                seed=base_seed
-            )
-            
-            result = sim.run()
-            
-            # Store results
-            all_results[n].append({
-                'seed_idx': seed_idx,
-                'conv_time': result['conv_time'] if not math.isnan(result['conv_time']) else None,
-                'msgs': result['msgs'],
-                'gossip_msgs': result['gossip_msgs'],
-                'reached': result['reached'],
-                'coverage': result['coverage']
-            })
-            
-            # Small delay between runs
-            time.sleep(1)
-    
-    return all_results
-
-
-def aggregate_results(all_results):
-    """
-    Aggregate results across multiple seeds for each N
-    """
-    aggregated = []
-    
-    for n, runs in sorted(all_results.items()):
-        # Filter out failed runs (where convergence didn't happen)
-        valid_times = [r['conv_time'] for r in runs if r['conv_time'] is not None]
-        valid_msgs = [r['msgs'] for r in runs]
-        valid_gossip = [r['gossip_msgs'] for r in runs]
-        valid_coverage = [float(r['coverage'].strip('%')) for r in runs]
-        
-        # Calculate statistics
-        avg_conv_time = np.mean(valid_times) if valid_times else float('nan')
-        std_conv_time = np.std(valid_times) if valid_times else float('nan')
-        
-        avg_msgs = np.mean(valid_msgs)
-        std_msgs = np.std(valid_msgs)
-        
-        avg_gossip = np.mean(valid_gossip)
-        avg_coverage = np.mean(valid_coverage)
-        
-        # Success rate (how many runs achieved target coverage)
-        success_rate = len(valid_times) / len(runs) * 100
-        
-        aggregated.append({
-            'n': n,
-            'avg_conv_time': avg_conv_time,
-            'std_conv_time': std_conv_time,
-            'avg_msgs': avg_msgs,
-            'std_msgs': std_msgs,
-            'avg_gossip_msgs': avg_gossip,
-            'avg_coverage': avg_coverage,
-            'success_rate': success_rate,
-            'num_runs': len(runs),
-            'successful_runs': len(valid_times),
-            'all_runs': runs  # Keep raw data for reference
-        })
-    
-    return aggregated
-
-
-def plot_results(aggregated_results, fanout, ttl):
-    """
-    Create charts of total messages and convergence time against N
-    """
-    # Extract data for plotting
-    n_values = [r['n'] for r in aggregated_results]
-    avg_msgs = [r['avg_msgs'] for r in aggregated_results]
-    std_msgs = [r['std_msgs'] for r in aggregated_results]
-    
-    avg_conv_time = [r['avg_conv_time'] for r in aggregated_results]
-    std_conv_time = [r['std_conv_time'] for r in aggregated_results]
-    
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    
-    # Plot 1: Total Messages vs N
-    ax1.errorbar(n_values, avg_msgs, yerr=std_msgs, marker='o', capsize=5, capthick=2, 
-                 color='blue', ecolor='lightblue', elinewidth=2)
-    ax1.set_xlabel('Number of Nodes (N)', fontsize=12)
-    ax1.set_ylabel('Total Messages', fontsize=12)
-    ax1.set_title(f'Total Messages vs Network Size\n(Fanout={fanout}, TTL={ttl})', fontsize=14)
-    ax1.grid(True, alpha=0.3)
-    ax1.set_xscale('log')
-    ax1.set_yscale('log')
-    
-    # Add trend line
-    z = np.polyfit(np.log(n_values), np.log(avg_msgs), 1)
-    trend_line = np.exp(z[1]) * np.array(n_values) ** z[0]
-    ax1.plot(n_values, trend_line, 'r--', alpha=0.7, label=f'Trend: O(N^{z[0]:.2f})')
-    ax1.legend()
-    
-    # Plot 2: Convergence Time vs N
-    ax2.errorbar(n_values, avg_conv_time, yerr=std_conv_time, marker='s', capsize=5, capthick=2,
-                 color='green', ecolor='lightgreen', elinewidth=2)
-    ax2.set_xlabel('Number of Nodes (N)', fontsize=12)
-    ax2.set_ylabel('Convergence Time (seconds)', fontsize=12)
-    ax2.set_title(f'Convergence Time vs Network Size\n(Fanout={fanout}, TTL={ttl})', fontsize=14)
-    ax2.grid(True, alpha=0.3)
-    ax2.set_xscale('log')
-    
-    # Add trend line for convergence time
-    z_time = np.polyfit(np.log(n_values), np.log(avg_conv_time), 1)
-    trend_time = np.exp(z_time[1]) * np.array(n_values) ** z_time[0]
-    ax2.plot(n_values, trend_time, 'r--', alpha=0.7, label=f'Trend: O(N^{z_time[0]:.2f})')
-    ax2.legend()
-    
-    plt.tight_layout()
-    plt.savefig('gossip_simulation_results.png', dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    return fig
-
-
-def print_detailed_results(aggregated_results, fanout, ttl, num_seeds):
-    """
-    Print detailed aggregated results in a formatted table
-    """
-    print("\n" + "=" * 60)
-    print(f"AGGREGATED RESULTS (Average over {num_seeds} seeds per N)")
-    print("=" * 60)
-    print(f"Fanout={fanout}, TTL={ttl}")
-    print("-" * 60)
-    print(f"{'N':<6} | {'Success':<10} | {'Avg Coverage':<12} | {'Avg Msgs':<12} | {'Std Msgs':<10} | {'Avg Gossip':<12} | {'Avg Time':<12} | {'Std Time':<10}")
-    print("-" * 60)
-    
-    for r in aggregated_results:
-        success_str = f"{r['successful_runs']}/{r['num_runs']}"
-        print(f"{r['n']:<6} | {success_str:<10} | {r['avg_coverage']:.1f}%{' ':<4} | {r['avg_msgs']:<12.0f} | {r['std_msgs']:<10.2f} | {r['avg_gossip_msgs']:<12.0f} | {r['avg_conv_time']:<12.4f} | {r['std_conv_time']:<10.4f}")
-    
-    print("=" * 60)
-
-
-# --- Main Execution ---
-
-if __name__ == "__main__":
-    # Configuration
-    N_VALUES = [10, 20, 50]  # Network sizes to test
+def run_benchmarks():
+    N_VALUES = [10, 20, 50]  # Different network sizes
+    SEEDS = [10, 20, 30, 40, 50]      # 5 different seeds
     FANOUT = 3
     TTL = 10
-    TIMEOUT = 15  # seconds
-    NUM_SEEDS = 5  # Number of different seeds to try per N
+    TIMEOUT = 15
 
-    # Run simulations with multiple seeds
-    all_results = run_multiple_seeds(
-        n_values=N_VALUES,
-        fanout=FANOUT,
-        ttl=TTL,
-        timeout=TIMEOUT,
-        num_seeds=NUM_SEEDS
-    )
+    final_results = []
+
+    for n in N_VALUES:
+        seed_runs = []
+        print(f"\n>>> Benchmarking N = {n} over {len(SEEDS)} seeds")
+        
+        for s in SEEDS:
+            sim = GossipNetworkSimulator(
+                n_nodes=n, 
+                fanout=FANOUT, 
+                ttl=TTL, 
+                timeout_seconds=TIMEOUT,
+                seed=s
+            )
+            
+            res = sim.run()
+            # Only include successful convergences in the timing average
+            if isinstance(res['conv_time'], float):
+                seed_runs.append(res)
+            
+            # Brief cooldown to let threads/ports clear
+            time.sleep(2)
+
+        # Aggregate results for this N
+        if seed_runs:
+            avg_msgs = statistics.mean([r['msgs'] for r in seed_runs])
+            avg_conv = statistics.mean([r['conv_time'] for r in seed_runs])
+            avg_coverage = statistics.mean([float(r['coverage'].strip('%')) for r in seed_runs])
+            avg_gossip = statistics.mean([r['gossip_msgs'] for r in seed_runs])
+
+            final_results.append({
+                'n': n,
+                'avg_msgs': avg_msgs,
+                'avg_conv': avg_conv,
+                'avg_gossip':avg_gossip,
+                'avg_coverage': avg_coverage
+            })
+
+    return final_results
+
+def plot_results(results):
+    ns = [r['n'] for r in results]
+    msgs = [r['avg_msgs'] for r in results]
+    conv_times = [r['avg_conv'] for r in results]
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    # Plot Total Messages (Left Axis)
+    color = 'tab:blue'
+    ax1.set_xlabel('Network Size (N)')
+    ax1.set_ylabel('Total Messages', color=color)
+    ax1.plot(ns, msgs, marker='o', color=color, label='Total Messages')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.grid(True, linestyle='--', alpha=0.7)
+
+    # Plot Convergence Time (Right Axis)
+    ax2 = ax1.twinx()
+    color = 'tab:red'
+    ax2.set_ylabel('Convergence Time (s)', color=color)
+    ax2.plot(ns, conv_times, marker='s', color=color, label='Conv. Time')
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    plt.title('Gossip Protocol Scalability: Messages & Convergence vs N')
+    fig.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    bench_data = run_benchmarks()
     
-    # Aggregate results
-    aggregated = aggregate_results(all_results)
-    
-    # Print detailed results
-    print_detailed_results(aggregated, FANOUT, TTL, NUM_SEEDS)
-    
-    # Create charts
-    print("\nGenerating charts...")
-    plot_results(aggregated, FANOUT, TTL)
-    
-    print("\nSimulation complete! Chart saved as 'gossip_simulation_results.png'")
+    # Print summary table
+    print("\n" + "="*50)
+    print(f"{'N':<10} | {'Avg Msgs':<15} | {'Avg Conv (s)':<15}")
+    print("-" * 50)
+    for data in bench_data:
+        print(f"{data['n']:<10} | {data['avg_msgs']:<15.2f} | {data['avg_conv']:<15.4f}")
+    print("\n" + "="*50)
+    print("\n\n")
+    plot_results(bench_data)
